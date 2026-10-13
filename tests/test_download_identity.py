@@ -90,6 +90,9 @@ class DownloadIdentityTests(unittest.TestCase):
 
     def test_changed_revision_restarts_instead_of_combining_tensor_bytes(self):
         self.seed(self.OLD, self.DATA[:24] + b"OLD")
+        identity = json.loads(self.manifest.read_text())
+        identity["sha256"] = hashlib.sha256(self.DATA[:24] + b"OLD").hexdigest()
+        self.manifest.write_text(json.dumps(identity))
         dl = self.run_download()
         self.assertEqual(dl.state, "complete", dl.detail)
         self.assertEqual(self.target.read_bytes(), self.DATA)

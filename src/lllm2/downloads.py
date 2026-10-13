@@ -203,28 +203,41 @@ def url_for(repo: str, file: str, revision: str = "main") -> str:
     return f"https://huggingface.co/{quote(repo, safe='/')}/resolve/{quote(revision, safe='')}/{quote(file, safe='/')}"
 
 
-def _size_of(repo: str, file: str, revision: str = "main") -> int:
-    """Content-Length without fetching the body, so the bar knows the whole job."""
-    req = urllib.request.Request(url_for(repo, file, revision), method="HEAD")
-    req.add_header("User-Agent", USER_AGENT)
-    try:
-        with urllib.request.urlopen(req, timeout=60, context=download_context()) as r:
-            return int(r.headers.get("Content-Length") or 0)
-    except Exception as error:
-        # An HTTP status is a response as well as an error; drop it properly.
-        if isinstance(error, urllib.error.HTTPError):
-            error.close()
-        return 0
+def _cancelled(dl: Download) -> bool:
+    """Acknowledge cancellation only once the worker stops using the part file."""
+    if not dl._cancel.is_set():
+        return False
+    dl.state = "cancelled"
+    dl.detail = "cancelled; part file kept for resume"
+    return True
 
 
-def _pin(dl: Download) -> None:
+def _pin(dl: Download) -> bool:
     """Resolve a mutable reference once, before trusting any partial bytes."""
     if dl.source:
-        return
-    info = metadata_get(
-        f"/{quote(dl.repo, safe='/')}/revision/{quote(dl.revision, safe='')}",
-        {"blobs": "true"},
-    )
+        return not _cancelled(dl)
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        if _cancelled(dl):
+            return False
+        try:
+            info = metadata_get(
+                f"/{quote(dl.repo, safe='/')}/revision/{quote(dl.revision, safe='')}",
+                {"blobs": "true"},
+            )
+            break
+        except Exception as error:
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+            if not transient(error) or attempt == RETRY_ATTEMPTS:
+                raise
+            dl.detail = (
+                f"retry metadata {attempt} after {str(error) or type(error).__name__}"
+            )
+            dl._cancel.wait(retry_delay(attempt))
+    if _cancelled(dl):
+        return False
+    if not isinstance(info, dict) or not isinstance(info.get("siblings"), list):
+        raise ValueError("Invalid download metadata: expected a siblings list.")
     revision = info.get("sha", "")
     if not isinstance(revision, str) or not re.fullmatch(r"[a-fA-F0-9]{40}", revision):
         raise ValueError("Cannot establish an immutable download revision.")
@@ -234,20 +247,48 @@ def _pin(dl: Download) -> None:
     ):
         raise ValueError("Download metadata does not match the requested revision.")
     source = {}
-    for sibling in info.get("siblings", []):
-        lfs = sibling.get("lfs") or {}
-        size = sibling.get("size") or lfs.get("size")
+    wanted = {dl.file, *dl.extras}
+    for sibling in info["siblings"]:
+        if not isinstance(sibling, dict):
+            continue
+        file = sibling.get("rfilename")
+        if not isinstance(file, str) or file not in wanted:
+            continue
+        if file in source:
+            raise ValueError(f"Duplicate download metadata for {file}.")
+        lfs = sibling.get("lfs")
+        if lfs is None:
+            lfs = {}
+        if not isinstance(lfs, dict):
+            raise ValueError(f"Invalid published download metadata for {file}.")
+        size = sibling.get("size")
+        if size is None:
+            size = lfs.get("size")
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            raise ValueError(f"Cannot establish the download size for {file}.")
         digest = lfs.get("sha256")
         if digest is not None and (
             not isinstance(digest, str) or not re.fullmatch(r"[a-fA-F0-9]{64}", digest)
         ):
             raise ValueError("Invalid published download hash.")
-        source[sibling["rfilename"]] = {"size": size, "sha256": digest}
-    for file in [dl.file, *dl.extras]:
-        size = source.get(file, {}).get("size")
-        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        source[file] = {"size": size, "sha256": digest}
+    for file in wanted:
+        if file not in source:
             raise ValueError(f"Cannot establish the download size for {file}.")
     dl.revision, dl.source = revision, source
+    # Persist before touching bytes: a process restart must request this same
+    # commit, even if the catalogue entry still names a mutable branch.
+    with _lock:
+        if _store and _downloads.get(dl.id) is dl:
+            saved = _store.get("download-job", dl.id)
+            if saved:
+                _store.put(
+                    "download-job",
+                    dl.id,
+                    {**saved, "entry": {**saved["entry"], "revision": revision}},
+                )
+    dl.detail = ""
+    return not _cancelled(dl)
 
 
 class HeaderReadError(Exception):
@@ -459,7 +500,8 @@ def _fetch(dl: Download, file: str, target: Path, base: int) -> bool:
     target.parent.mkdir(parents=True, exist_ok=True)
     part = target.with_suffix(target.suffix + ".part")
     part.parent.mkdir(parents=True, exist_ok=True)
-    _pin(dl)
+    if not _pin(dl):
+        return False
     identity = {
         "repo": dl.repo,
         "revision": dl.revision,
@@ -471,8 +513,17 @@ def _fetch(dl: Download, file: str, target: Path, base: int) -> bool:
         saved = json.loads(manifest.read_text())
     except (OSError, ValueError):
         saved = None
-    if saved != identity:
-        # Legacy or changed-revision bytes cannot be safely appended to.
+    same_content = (
+        isinstance(saved, dict)
+        and identity["sha256"] is not None
+        and isinstance(saved.get("sha256"), str)
+        and saved["sha256"].lower() == identity["sha256"].lower()
+        and type(saved.get("size")) is int
+        and all(saved.get(key) == identity[key] for key in ("repo", "file", "size"))
+    )
+    if saved != identity and not same_content:
+        # A published content hash survives unrelated commits. Without one,
+        # only an exact pinned identity can safely reuse partial bytes.
         part.unlink(missing_ok=True)
     temporary = manifest.with_suffix(manifest.suffix + ".tmp")
     temporary.write_text(json.dumps(identity))
@@ -511,21 +562,36 @@ def _fetch(dl: Download, file: str, target: Path, base: int) -> bool:
             dl.detail = "cancelled; part file kept for resume"
             return False
     if part.stat().st_size != identity["size"]:
+        part.unlink()
+        manifest.unlink(missing_ok=True)
         raise ValueError(
             f"Downloaded size does not match the published size for {file}."
         )
+    dl.detail = "verifying"
     if identity["sha256"]:
+        digest = hashlib.sha256()
         with part.open("rb") as stream:
-            digest = hashlib.file_digest(stream, "sha256").hexdigest()
-        if digest.lower() != identity["sha256"].lower():
+            while True:
+                if dl._cancel.is_set():
+                    break
+                chunk = stream.read(CHUNK)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        if _cancelled(dl):
+            return False
+        if digest.hexdigest().lower() != identity["sha256"].lower():
             part.unlink()
             manifest.unlink(missing_ok=True)
             raise ValueError(
                 f"Downloaded SHA-256 does not match the published hash for {file}."
             )
     gguf.header(part)
+    if _cancelled(dl):
+        return False
     part.rename(target)
     manifest.unlink(missing_ok=True)
+    dl.detail = ""
     return True
 
 
@@ -542,8 +608,14 @@ def _run(dl: Download) -> None:
             dl.started = time.time()
         # Size the whole job up front: a bar that resets when the projector
         # starts reads as a fault rather than as the second of two files.
-        _pin(dl)
-        dl.total = sum(dl.source[f]["size"] for f, _ in jobs)
+        if all(target.is_file() for _, target in jobs):
+            # Completed files already passed promotion checks (legacy files
+            # still get their GGUF header checked below). They work offline.
+            dl.total = sum(target.stat().st_size for _, target in jobs)
+        else:
+            if not _pin(dl):
+                return
+            dl.total = sum(dl.source[f]["size"] for f, _ in jobs)
         occupied = sum(
             target.stat().st_size
             if target.is_file()
@@ -574,7 +646,7 @@ def _run(dl: Download) -> None:
     except urllib.error.HTTPError as e:
         e.close()
         dl.state = "error"
-        dl.detail = f"HTTP {e.code} for {url_for(dl.repo, dl.file, dl.revision)}"
+        dl.detail = f"HTTP {e.code} for {e.url}"
     except Exception as e:
         dl.state = "error"
         dl.detail = str(e)
